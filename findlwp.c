@@ -85,4 +85,5 @@ int main(int argc, char** argv){
 	pids[i] = pid;
 	close(fd[i][1]);
   }
+  return 0;
 }  
