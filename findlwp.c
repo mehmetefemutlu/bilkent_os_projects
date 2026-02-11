@@ -4,11 +4,15 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/select.h>
+#include <sys/wait.h>
+#include <errno.h>
 #define R 0
 #define W 1
 
 static void message(const char* program){
-  fprintf(stderr, "Usage: %s FilePrefix N K DataLen OutFilename\n", program, program);
+  fprintf(stderr, "Usage: %s FilePrefix N K DataLen OutFilename\n", program);
 };
 
 static void makeInputFilename(char* buffer, size_t buffersize, const char* prefix, int i) {
@@ -21,7 +25,12 @@ static void makeInputFilename(char* buffer, size_t buffersize, const char* prefi
 
 
 static void child_process(const char* filePrefix, int n, int k, int fileIndex, int dataLength, int writefd){
-//to be implemented
+  (void)filePrefix;
+  (void)n;
+  (void)k;
+  (void)fileIndex;
+  (void)dataLength;
+  (void)writefd;
 };
 
 int main(int argc, char** argv){
@@ -55,7 +64,7 @@ int main(int argc, char** argv){
   int fd[n][2];
 
   for(int i = 0; i < n; i++){ //n pipe creation for n child
-  	if(pipe(fd[i] < 0)) {
+  	if(pipe(fd[i]) < 0) {
 	  fprintf(stderr, "Pipe failed\n");
 	  return 1;
         }
