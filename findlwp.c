@@ -9,9 +9,6 @@
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <sys/types.h>
-#include <sys/select.h>
-#include <sys/wait.h>
-#include <errno.h>
 #define R 0
 #define W 1
 
