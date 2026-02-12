@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include <ctype.h>
 #define R 0
 #define W 1
 
@@ -17,7 +18,7 @@ typedef struct {
 	int fileIndex;
 	int lineNo;
 	char* word;
-} Occurences;
+} Occurrence;
 
 static void message(const char* program){
   fprintf(stderr, "Usage: %s FilePrefix N K DataLen OutFilename\n", program);
@@ -41,7 +42,7 @@ static int writeToParent(int fd, const char* buffer, size_t length, int dataLeng
 
     		ssize_t w_data = write(fd, buffer + off, chunk);
 
-		if(w < 0){
+		if(w_data < 0){
 			if (errno == EINTR) continue;
       			return -1;
 		}
@@ -51,10 +52,10 @@ static int writeToParent(int fd, const char* buffer, size_t length, int dataLeng
   	return 0;
 }
 
-static void pipe_push(Occurences** arr, int* size, int* capacity, const char* word, int fileIndex, int lineNo){
+static void pipe_push(Occurrence** arr, int* size, int* capacity, const char* word, int fileIndex, int lineNo){
 	if (*size == *capacity) {
     		int newCapacity = (*capacity == 0) ? 256 : (*capacity * 2);
-  		Occurences *temp = (Occurences*)realloc(*arr, (size_t)newCapacity * sizeof(Occurences));
+  		Occurrence *temp = (Occurrence*)realloc(*arr, (size_t)newCapacity * sizeof(Occurrence));
  		if (!temp) {
       			fprintf(stderr, "Out of memory\n");
       			exit(1);
@@ -72,8 +73,68 @@ static void pipe_push(Occurences** arr, int* size, int* capacity, const char* wo
   	(*size)++;
 }
 
+static void free_occurrences(Occurrence* arr, int size){
+	for (int i = 0; i < size; i++) {
+		free(arr[i].word);
+	}
+	free(arr);
+}
+
+static int cmp_occurrence(const void* a, const void* b){
+	const Occurrence* oa = (const Occurrence*)a;
+	const Occurrence* ob = (const Occurrence*)b;
+	int c = strcmp(oa->word, ob->word);
+	if (c != 0) return c;
+	if (oa->fileIndex != ob->fileIndex) return oa->fileIndex - ob->fileIndex;
+	return oa->lineNo - ob->lineNo;
+}
+
+static int parse_record_line(const char* line, char** out_word, int* out_file, int* out_line){
+	const char* p = line;
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (*p == '\0') return -1;
+
+	const char* w_start = p;
+	while (*p && !isspace((unsigned char)*p)) p++;
+	if (p == w_start) return -1;
+	size_t w_len = (size_t)(p - w_start);
+	char* word = (char*)malloc(w_len + 1);
+	if (!word) return -1;
+	memcpy(word, w_start, w_len);
+	word[w_len] = '\0';
+
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (*p == '\0') {
+		free(word);
+		return -1;
+	}
+	char* endptr = NULL;
+	long file_idx = strtol(p, &endptr, 10);
+	if (endptr == p) {
+		free(word);
+		return -1;
+	}
+	p = endptr;
+	while (*p && isspace((unsigned char)*p)) p++;
+	if (*p == '\0') {
+		free(word);
+		return -1;
+	}
+	long line_no = strtol(p, &endptr, 10);
+	if (endptr == p) {
+		free(word);
+		return -1;
+	}
+
+	*out_word = word;
+	*out_file = (int)file_idx;
+	*out_line = (int)line_no;
+	return 0;
+}
+
 
 static void child_process(const char* filePrefix, int n, int k, int fileIndex, int dataLength, int writefd){
+	(void)n;
 	char filename[512];
 	makeInputFilename(filename, sizeof(filename), filePrefix, fileIndex);
 
@@ -84,7 +145,7 @@ static void child_process(const char* filePrefix, int n, int k, int fileIndex, i
 		_exit(2);
 	}
 
-	Occurences* o = NULL;
+	Occurrence* o = NULL;
   	int size = 0;
 	int capacity = 0;
 
@@ -110,12 +171,19 @@ static void child_process(const char* filePrefix, int n, int k, int fileIndex, i
   	fclose(f);
 
 	for (int i = 0; i < size; i++) {
-    		char rec[2048];
-    		int m = snprintf(rec, sizeof(rec), "%s %d %d\n", o[i].word, o[i].fileIndex, o[i].lineNo);
-    		if (m > 0) {
-      			writeToParent(writefd, rec, (size_t)m, dataLength);
-    		}
+		int m = snprintf(NULL, 0, "%s %d %d\n", o[i].word, o[i].fileIndex, o[i].lineNo);
+		if (m <= 0) continue;
+		char* rec = (char*)malloc((size_t)m + 1);
+		if (!rec) {
+			fprintf(stderr, "Out of memory\n");
+			break;
+		}
+		snprintf(rec, (size_t)m + 1, "%s %d %d\n", o[i].word, o[i].fileIndex, o[i].lineNo);
+		writeToParent(writefd, rec, (size_t)m, dataLength);
+		free(rec);
   	}
+	close(writefd);
+	free_occurrences(o, size);
 }
 
 int main(int argc, char** argv){
@@ -153,9 +221,6 @@ int main(int argc, char** argv){
           fprintf(stderr, "Pipe failed\n");
           return 1;
         }
-        else{
-          printf("Pipe created succesfully\n");
-        }
   	  }
 
 
@@ -168,8 +233,6 @@ int main(int argc, char** argv){
           return 1;
       }
       if(pid == 0){ //child process
-        printf("Child created succesfully\n");
-
         for(int j = 0; j < n; j++){
         close(fd[j][0]);
         if(j != i){
@@ -185,14 +248,145 @@ int main(int argc, char** argv){
       close(fd[i][1]);
   	}
 
-	//after this point to child deletion, parent must read data from pipes, sort it and process it.
-	//child process and writing into pipes are done.
+	Occurrence* all = NULL;
+	int all_size = 0;
+	int all_capacity = 0;
+
+	char** buffers = (char**)calloc((size_t)n, sizeof(char*));
+	size_t* buf_len = (size_t*)calloc((size_t)n, sizeof(size_t));
+	size_t* buf_cap = (size_t*)calloc((size_t)n, sizeof(size_t));
+	bool* closed = (bool*)calloc((size_t)n, sizeof(bool));
+	if (!buffers || !buf_len || !buf_cap || !closed) {
+		fprintf(stderr, "Out of memory\n");
+		return 1;
+	}
+
+	int open_pipes = n;
+	while (open_pipes > 0) {
+		fd_set readset;
+		FD_ZERO(&readset);
+		int maxfd = -1;
+		for (int i = 0; i < n; i++) {
+			if (closed[i]) continue;
+			FD_SET(fd[i][0], &readset);
+			if (fd[i][0] > maxfd) maxfd = fd[i][0];
+		}
+
+		int sel;
+		do {
+			sel = select(maxfd + 1, &readset, NULL, NULL, NULL);
+		} while (sel < 0 && errno == EINTR);
+		if (sel < 0) {
+			fprintf(stderr, "select() failed\n");
+			break;
+		}
+
+		for (int i = 0; i < n; i++) {
+			if (closed[i]) continue;
+			if (!FD_ISSET(fd[i][0], &readset)) continue;
+
+			char tmp[1024];
+			size_t chunk = (size_t)dataLength;
+			if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
+			ssize_t r = read(fd[i][0], tmp, chunk);
+			if (r == 0) {
+				close(fd[i][0]);
+				closed[i] = true;
+				open_pipes--;
+				continue;
+			}
+			if (r < 0) {
+				if (errno == EINTR) continue;
+				fprintf(stderr, "read() failed\n");
+				close(fd[i][0]);
+				closed[i] = true;
+				open_pipes--;
+				continue;
+			}
+
+			if (buf_len[i] + (size_t)r + 1 > buf_cap[i]) {
+				size_t new_cap = buf_cap[i] == 0 ? 1024 : buf_cap[i] * 2;
+				while (new_cap < buf_len[i] + (size_t)r + 1) new_cap *= 2;
+				char* nb = (char*)realloc(buffers[i], new_cap);
+				if (!nb) {
+					fprintf(stderr, "Out of memory\n");
+					close(fd[i][0]);
+					closed[i] = true;
+					open_pipes--;
+					continue;
+				}
+				buffers[i] = nb;
+				buf_cap[i] = new_cap;
+			}
+			memcpy(buffers[i] + buf_len[i], tmp, (size_t)r);
+			buf_len[i] += (size_t)r;
+			buffers[i][buf_len[i]] = '\0';
+
+			char* start = buffers[i];
+			char* nl = NULL;
+			while ((nl = memchr(start, '\n', buf_len[i] - (size_t)(start - buffers[i])))) {
+				*nl = '\0';
+				char* word = NULL;
+				int file_idx = 0;
+				int line_no = 0;
+				if (parse_record_line(start, &word, &file_idx, &line_no) == 0) {
+					pipe_push(&all, &all_size, &all_capacity, word, file_idx, line_no);
+				}
+				free(word);
+				start = nl + 1;
+			}
+
+			size_t remaining = buf_len[i] - (size_t)(start - buffers[i]);
+			if (remaining > 0 && start != buffers[i]) {
+				memmove(buffers[i], start, remaining);
+			}
+			buf_len[i] = remaining;
+			buffers[i][buf_len[i]] = '\0';
+		}
+	}
+
+	for (int i = 0; i < n; i++) {
+		free(buffers[i]);
+	}
+	free(buffers);
+	free(buf_len);
+	free(buf_cap);
+	free(closed);
+
+	if (all_size > 1) {
+		qsort(all, (size_t)all_size, sizeof(Occurrence), cmp_occurrence);
+	}
+
+	FILE* out = fopen(outputFileName, "w");
+	if (!out) {
+		fprintf(stderr, "Failed to open output file\n");
+		free_occurrences(all, all_size);
+		return 1;
+	}
+
+	int i = 0;
+	while (i < all_size) {
+		int j = i + 1;
+		while (j < all_size && strcmp(all[i].word, all[j].word) == 0) {
+			j++;
+		}
+		int count = j - i;
+		fprintf(out, "%s (count=%d): ", all[i].word, count);
+		for (int k = i; k < j; k++) {
+			fprintf(out, "%d-%d", all[k].fileIndex, all[k].lineNo);
+			if (k + 1 < j) {
+				fprintf(out, ", ");
+			}
+		}
+		fprintf(out, "\n");
+		i = j;
+	}
+	fclose(out);
+	free_occurrences(all, all_size);
 
     for(int i = 0; i < n; i++){
       waitpid(pids[i], NULL, 0);
     }
 
-
-	//for here, output file must be written out.
   	return 0;
 }
