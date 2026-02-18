@@ -1,9 +1,11 @@
-#define POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include <pthread.h>
 
 typedef struct {
@@ -80,6 +82,7 @@ static void *worker(void *arg) {
     FILE *f = fopen(filename, "r");
     if (!f) {
         tr->ok = 0;
+        fprintf(stderr, "Open failed\n", filename);
         return NULL;
     }
     tr->ok = 1;
