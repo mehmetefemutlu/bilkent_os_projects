@@ -1,8 +1,12 @@
+#define _GNU_SOURCE
+
 #include "tus.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <ucontext.h>
 
 /* =========================
@@ -24,7 +28,9 @@ typedef struct TCB {
     char *stack;                 /* NULL for main thread */
     void *(*start_func)(void *);
     void *arg;
-    int waiting_for;             /* for join later, -1 if none */
+    int waiting_for;             /* target tid if joining, -1 if none */
+    int resume_flag;             /* distinguishes getcontext() returns */
+    int yield_result;            /* tid returned by tus_yield() later */
 } TCB;
 
 /* =========================
@@ -111,16 +117,24 @@ static int valid_sched_alg(int salg) {
     return (salg == ALG_FCFS || salg == ALG_RANDOM);
 }
 
-static TCB *get_tcb_by_tid(int tid) {
-    if (tid <= 0 || tid >= next_tid) {
-        return NULL;
-    }
+static int find_slot_by_tid(int tid) {
     for (int i = 0; i < TUS_MAXTHREADS; i++) {
         if (threads[i] != NULL && threads[i]->tid == tid) {
-            return threads[i];
+            return i;
         }
     }
-    return NULL;
+    return -1;
+}
+
+static TCB *get_tcb_by_tid(int tid) {
+    if (tid <= 0) {
+        return NULL;
+    }
+    int slot = find_slot_by_tid(tid);
+    if (slot == -1) {
+        return NULL;
+    }
+    return threads[slot];
 }
 
 static int find_free_slot(void) {
@@ -134,6 +148,33 @@ static int find_free_slot(void) {
 
 static TCB *current_tcb(void) {
     return get_tcb_by_tid(current_tid);
+}
+
+static int count_active_threads(void) {
+    int count = 0;
+
+    for (int i = 0; i < TUS_MAXTHREADS; i++) {
+        if (threads[i] != NULL && threads[i]->state != T_ENDED) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static void destroy_thread(int tid) {
+    int slot = find_slot_by_tid(tid);
+    TCB *tcb;
+
+    if (slot == -1) {
+        return;
+    }
+
+    tcb = threads[slot];
+    threads[slot] = NULL;
+
+    free(tcb->stack);
+    free(tcb);
 }
 
 static int pick_next_tid_by_sched(void) {
@@ -204,6 +245,8 @@ int tus_init(int salg) {
     main_tcb->start_func = NULL;
     main_tcb->arg = NULL;
     main_tcb->waiting_for = -1;
+    main_tcb->resume_flag = 0;
+    main_tcb->yield_result = TUS_ERROR;
 
     if (getcontext(&main_tcb->context) == -1) {
         free(main_tcb);
@@ -219,6 +262,7 @@ int tus_init(int salg) {
     threads[slot] = main_tcb;
     current_tid = main_tcb->tid;
     initialized = 1;
+    srand((unsigned)time(NULL));
 
     return main_tcb->tid;
 }
@@ -243,10 +287,6 @@ int tus_create_thread(void *(*tsf)(void *), void *targ) {
         return TUS_ERROR;
     }
 
-    if (next_tid > TUS_MAXTHREADS) {
-        return TUS_ERROR;
-    }
-
     TCB *tcb = (TCB *)malloc(sizeof(TCB));
     if (tcb == NULL) {
         return TUS_ERROR;
@@ -264,6 +304,8 @@ int tus_create_thread(void *(*tsf)(void *), void *targ) {
     tcb->start_func = tsf;
     tcb->arg = targ;
     tcb->waiting_for = -1;
+    tcb->resume_flag = 0;
+    tcb->yield_result = TUS_ERROR;
 
     /*
      * Initial context is copied from current running thread context.
@@ -288,6 +330,9 @@ int tus_create_thread(void *(*tsf)(void *), void *targ) {
     tcb->context.uc_mcontext.gregs[REG_RSP] = (greg_t)stack_top;
     tcb->context.uc_mcontext.gregs[REG_RDI] = (greg_t)tsf;
     tcb->context.uc_mcontext.gregs[REG_RSI] = (greg_t)targ;
+    tcb->context.uc_stack.ss_sp = tcb->stack;
+    tcb->context.uc_stack.ss_size = TUS_STACKSIZE;
+    tcb->context.uc_link = NULL;
 
     threads[slot] = tcb;
 
@@ -317,15 +362,17 @@ int tus_yield(int tid) {
      *  - first: right after saving caller context
      *  - second: when caller is scheduled again later with setcontext()
      */
-    volatile int resumed = 0;
     if (getcontext(&caller->context) == -1) {
         return TUS_ERROR;
     }
 
-    if (resumed == 1) {
-        return current_tid;
+    if (caller->resume_flag) {
+        caller->resume_flag = 0;
+        caller->state = T_RUNNING;
+        current_tid = caller->tid;
+        return caller->yield_result;
     }
-    resumed = 1;
+    caller->resume_flag = 1;
 
     int next_tid = -1;
     TCB *next_tcb = NULL;
@@ -339,12 +386,14 @@ int tus_yield(int tid) {
     if (tid > 0) {
         next_tcb = get_tcb_by_tid(tid);
         if (next_tcb == NULL || next_tcb->state != T_READY) {
+            caller->resume_flag = 0;
             return TUS_ERROR;
         }
 
         next_tid = tid;
 
         if (rq_remove_tid(next_tid) == TUS_ERROR) {
+            caller->resume_flag = 0;
             return TUS_ERROR;
         }
     }
@@ -355,20 +404,26 @@ int tus_yield(int tid) {
          */
         caller->state = T_READY;
         if (rq_push(caller->tid) == TUS_ERROR) {
+            caller->resume_flag = 0;
+            caller->state = T_RUNNING;
             return TUS_ERROR;
         }
 
         next_tid = pick_next_tid_by_sched();
         if (next_tid == TUS_ERROR) {
+            caller->resume_flag = 0;
+            caller->state = T_RUNNING;
             return TUS_ERROR;
         }
 
         next_tcb = get_tcb_by_tid(next_tid);
         if (next_tcb == NULL) {
+            caller->resume_flag = 0;
             return TUS_ERROR;
         }
     }
     else {
+        caller->resume_flag = 0;
         return TUS_ERROR;
     }
 
@@ -380,6 +435,8 @@ int tus_yield(int tid) {
     if (tid > 0) {
         caller->state = T_READY;
         if (rq_push(caller->tid) == TUS_ERROR) {
+            caller->resume_flag = 0;
+            caller->state = T_RUNNING;
             return TUS_ERROR;
         }
     }
@@ -387,6 +444,7 @@ int tus_yield(int tid) {
     /*
      * Switch to selected thread
      */
+    caller->yield_result = next_tid;
     caller->state = T_READY;
     next_tcb->state = T_RUNNING;
     current_tid = next_tcb->tid;
@@ -400,17 +458,103 @@ int tus_yield(int tid) {
 }
 
 void tus_exit(void) {
+    TCB *caller;
+    int next_tid;
+    TCB *next_tcb;
+
+    if (!initialized) {
+        exit(0);
+    }
+
+    caller = current_tcb();
+    if (caller == NULL) {
+        exit(0);
+    }
+
+    caller->state = T_ENDED;
+    caller->waiting_for = -1;
+    caller->resume_flag = 0;
+
+    if (count_active_threads() == 0) {
+        exit(0);
+    }
+
+    next_tid = pick_next_tid_by_sched();
+    if (next_tid == TUS_ERROR) {
+        exit(0);
+    }
+
+    next_tcb = get_tcb_by_tid(next_tid);
+    if (next_tcb == NULL) {
+        exit(0);
+    }
+
+    next_tcb->state = T_RUNNING;
+    current_tid = next_tcb->tid;
+    setcontext(&next_tcb->context);
+
     exit(0);
 }
 
 int tus_join(int tid) {
-    (void)tid;
-    return TUS_ERROR;
+    TCB *caller;
+    TCB *target;
+
+    if (!initialized || tid <= 0) {
+        return TUS_ERROR;
+    }
+
+    caller = current_tcb();
+    if (caller == NULL || tid == caller->tid) {
+        return TUS_ERROR;
+    }
+
+    target = get_tcb_by_tid(tid);
+    if (target == NULL) {
+        return TUS_ERROR;
+    }
+
+    caller->waiting_for = tid;
+
+    while (target->state != T_ENDED) {
+        if (tus_yield(TUS_ANY) == TUS_ERROR) {
+            caller->waiting_for = -1;
+            return TUS_ERROR;
+        }
+        target = get_tcb_by_tid(tid);
+        if (target == NULL) {
+            caller->waiting_for = -1;
+            return TUS_ERROR;
+        }
+    }
+
+    destroy_thread(tid);
+    caller->waiting_for = -1;
+    return tid;
 }
 
 int tus_cancel(int tid) {
-    (void)tid;
-    return TUS_ERROR;
+    TCB *target;
+
+    if (!initialized || tid <= 0 || tid == current_tid) {
+        return TUS_ERROR;
+    }
+
+    target = get_tcb_by_tid(tid);
+    if (target == NULL || target->state == T_ENDED) {
+        return TUS_ERROR;
+    }
+
+    if (target->state == T_READY) {
+        if (rq_remove_tid(tid) == TUS_ERROR) {
+            return TUS_ERROR;
+        }
+    }
+
+    target->state = T_ENDED;
+    target->waiting_for = -1;
+    target->resume_flag = 0;
+    return TUS_SUCCESS;
 }
 
 int tus_gettid(void) {
