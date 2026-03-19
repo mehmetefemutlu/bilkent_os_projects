@@ -37,14 +37,12 @@ int main(void) {
         fprintf(stderr, "tus_init failed\n");
         return 1;
     }
-
     tid_a = tus_create_thread(worker_a, &loops_a);
     tid_b = tus_create_thread(worker_b, &loops_b);
     if (tid_a == TUS_ERROR || tid_b == TUS_ERROR) {
         fprintf(stderr, "thread creation failed\n");
         return 1;
     }
-
     printf("main tid=%d created threads %d and %d\n", main_tid, tid_a, tid_b);
 
     while (tus_join(tid_a) != tid_a) {
