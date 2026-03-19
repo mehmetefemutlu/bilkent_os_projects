@@ -83,7 +83,18 @@ static int rq_pop(void) {
     return tid;
 }
 
-/* For now, simple linear remove by rebuilding queue */
+static int rq_push_front(int tid) {
+    if (rq_size >= TUS_MAXTHREADS) {
+        return TUS_ERROR;
+    }
+
+    rq_head = (rq_head - 1 + TUS_MAXTHREADS) % TUS_MAXTHREADS;
+    ready_q[rq_head] = tid;
+    rq_size++;
+    return TUS_SUCCESS;
+}
+
+/* Remove a specific tid while preserving the order of the others. */
 static int rq_remove_tid(int tid) {
     if (rq_empty()) {
         return TUS_ERROR;
@@ -352,6 +363,11 @@ int tus_yield(int tid) {
     }
 
     TCB *caller = current_tcb();
+    int next_tid = -1;
+    TCB *next_tcb = NULL;
+    int caller_pushed = 0;
+    int target_removed = 0;
+
     if (caller == NULL) {
         return TUS_ERROR;
     }
@@ -374,16 +390,20 @@ int tus_yield(int tid) {
     }
     caller->resume_flag = 1;
 
-    int next_tid = -1;
-    TCB *next_tcb = NULL;
-
     /*
      * If yielding to a specific positive tid:
      * - it must exist
-     * - it must be READY
+     * - it must be READY unless it is the caller itself
      * - if not, return immediately with error
      */
     if (tid > 0) {
+        if (tid == caller->tid) {
+            caller->yield_result = caller->tid;
+            caller->state = T_READY;
+            current_tid = caller->tid;
+            setcontext(&caller->context);
+        }
+
         next_tcb = get_tcb_by_tid(tid);
         if (next_tcb == NULL || next_tcb->state != T_READY) {
             caller->resume_flag = 0;
@@ -396,6 +416,7 @@ int tus_yield(int tid) {
             caller->resume_flag = 0;
             return TUS_ERROR;
         }
+        target_removed = 1;
     }
     else if (tid == TUS_ANY) {
         /*
@@ -408,9 +429,13 @@ int tus_yield(int tid) {
             caller->state = T_RUNNING;
             return TUS_ERROR;
         }
+        caller_pushed = 1;
 
         next_tid = pick_next_tid_by_sched();
         if (next_tid == TUS_ERROR) {
+            if (caller_pushed) {
+                (void)rq_remove_tid(caller->tid);
+            }
             caller->resume_flag = 0;
             caller->state = T_RUNNING;
             return TUS_ERROR;
@@ -418,7 +443,14 @@ int tus_yield(int tid) {
 
         next_tcb = get_tcb_by_tid(next_tid);
         if (next_tcb == NULL) {
+            if (caller_pushed && next_tid != caller->tid) {
+                (void)rq_remove_tid(caller->tid);
+            }
+            if (rq_push_front(next_tid) == TUS_ERROR) {
+                (void)rq_push(next_tid);
+            }
             caller->resume_flag = 0;
+            caller->state = T_RUNNING;
             return TUS_ERROR;
         }
     }
@@ -435,10 +467,16 @@ int tus_yield(int tid) {
     if (tid > 0) {
         caller->state = T_READY;
         if (rq_push(caller->tid) == TUS_ERROR) {
+            if (target_removed) {
+                if (rq_push_front(next_tid) == TUS_ERROR) {
+                    (void)rq_push(next_tid);
+                }
+            }
             caller->resume_flag = 0;
             caller->state = T_RUNNING;
             return TUS_ERROR;
         }
+        caller_pushed = 1;
     }
 
     /*
