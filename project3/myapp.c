@@ -219,6 +219,8 @@ int main(int argc, char **argv)
     pid_t  pids[NUMP];
     int    i, ret;
     int    deadlock_reported = 0;
+    char  *endptr = NULL;
+    long   parsed_flag;
 
     if (argc != 2) {
         fprintf(stderr,
@@ -228,7 +230,17 @@ int main(int argc, char **argv)
                 argv[0]);
         return 1;
     }
-    AVOID = atoi(argv[1]);
+    parsed_flag = strtol(argv[1], &endptr, 10);
+    if (argv[1][0] == '\0' || endptr == argv[1] || *endptr != '\0' ||
+        (parsed_flag != 0 && parsed_flag != 1)) {
+        fprintf(stderr,
+                "Usage: %s <flag>\n"
+                "  flag=0  avoidance disabled  (deadlock occurs & is detected)\n"
+                "  flag=1  avoidance enabled   (deadlock is prevented)\n",
+                argv[0]);
+        return 1;
+    }
+    AVOID = (int)parsed_flag;
 
     /* ---- Initialise library ---- */
     memset(exist, 0, sizeof exist);

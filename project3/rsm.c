@@ -647,8 +647,11 @@ void rsm_print_state(char headermsg[])
     if (map_existing_state() != 0) return;
     if (lock_state() != 0) return;
 
-    printf("########################## %s ###########################\n",
-           headermsg ? headermsg : "");
+    printf("##########################\n");
+    if (headermsg != NULL && headermsg[0] != '\0') {
+        printf("%s\n", headermsg);
+    }
+    printf("###########################\n");
 
     printf("Exist:\n");
     printf("     ");
