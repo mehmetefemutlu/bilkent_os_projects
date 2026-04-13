@@ -285,8 +285,9 @@ int main(int argc, char **argv)
         } else if (AVOID && ret == 0) {
             /* Check whether all children have already finished */
             int all_done = 1;
-            for (i = 0; i < NUMP; ++i) {
-                if (waitpid(pids[i], NULL, WNOHANG) == 0) {
+            int k;
+            for (k = 0; k < NUMP; ++k) {
+                if (waitpid(pids[k], NULL, WNOHANG) == 0) {
                     all_done = 0;
                 }
             }
