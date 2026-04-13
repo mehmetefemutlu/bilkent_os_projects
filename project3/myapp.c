@@ -27,9 +27,6 @@
  *     Banker's algorithm finds that granting R1 to P1 while P0 holds R0
  *     leads to an unsafe state and therefore denies P1 until P0 finishes.
  *     All processes complete without deadlock.
- *
- * Compilation (handled by Makefile):
- *   gcc -Wall -g -o myapp myapp.c -L. -lrsm -lpthread -lrt
  */
 
 #include <stdio.h>
@@ -41,8 +38,8 @@
 
 #include "rsm.h"
 
-#define NUMP 3   /* number of child processes  */
-#define NUMR 5   /* number of resource types   */
+#define NUMP 3   // number of child processes
+#define NUMR 5   // number of resource types
 
 /* Set by main from argv[1] */
 static int AVOID = 0;
