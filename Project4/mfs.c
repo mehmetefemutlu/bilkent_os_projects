@@ -178,6 +178,44 @@ static int free_inode(uint32_t inode_no)
     return mfs_write_block(fd_disk, bitmap, MFS_INODE_BITMAP_BLOCK) == 0 ? 0 : -EIO;
 }
 
+static int allocate_block(uint32_t *block_no)
+{
+    uint8_t bitmap[MFS_BLOCK_SIZE];
+
+    if (mfs_read_block(fd_disk, bitmap, MFS_BLOCK_BITMAP_BLOCK) != 0) {
+        return -EIO;
+    }
+
+    for (uint32_t i = MFS_FIRST_DATA_BLOCK; i < superblock.block_count; i++) {
+        if (!mfs_get_bit(bitmap, i)) {
+            mfs_set_bit(bitmap, i, 1);
+            if (mfs_write_block(fd_disk, bitmap, MFS_BLOCK_BITMAP_BLOCK) != 0) {
+                return -EIO;
+            }
+            *block_no = i;
+            return 0;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+static int free_block(uint32_t block_no)
+{
+    uint8_t bitmap[MFS_BLOCK_SIZE];
+
+    if (block_no < MFS_FIRST_DATA_BLOCK || block_no >= superblock.block_count) {
+        return -EINVAL;
+    }
+
+    if (mfs_read_block(fd_disk, bitmap, MFS_BLOCK_BITMAP_BLOCK) != 0) {
+        return -EIO;
+    }
+
+    mfs_set_bit(bitmap, block_no, 0);
+    return mfs_write_block(fd_disk, bitmap, MFS_BLOCK_BITMAP_BLOCK) == 0 ? 0 : -EIO;
+}
+
 static int mfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
 {
     const char *name;
@@ -346,6 +384,23 @@ static int mfs_unlink(const char *path)
     }
 
     inode_no = entries[entry_index].inode_no;
+
+    /* Free data blocks and index block */
+    {
+        struct mfs_inode file_inode;
+        if (read_inode(inode_no, &file_inode) == 0 && file_inode.index_block != 0) {
+            uint32_t idx_data[MFS_BLOCK_SIZE / 4];
+            if (mfs_read_block(fd_disk, idx_data, file_inode.index_block) == 0) {
+                for (uint32_t i = 0; i < file_inode.block_count && i < MFS_BLOCK_SIZE / 4; i++) {
+                    if (idx_data[i] != 0) {
+                        free_block(idx_data[i]);
+                    }
+                }
+            }
+            free_block(file_inode.index_block);
+        }
+    }
+
     memset(&entries[entry_index], 0, sizeof(entries[entry_index]));
     rc = write_root_dir(entries);
     if (rc != 0) {
@@ -365,23 +420,208 @@ static int mfs_unlink(const char *path)
 static int mfs_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-    (void) path;
-    (void) buf;
-    (void) size;
-    (void) offset;
+    const char *name;
+    struct mfs_dir_entry entry;
+    struct mfs_inode inode;
+    uint32_t idx_data[MFS_BLOCK_SIZE / 4];
+    size_t bytes_read = 0;
+    size_t to_read_total;
+    int rc;
+
     (void) fi;
-    return 0;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    name = path_name(path);
+    if (name == NULL || name[0] == '\0') {
+        return -EINVAL;
+    }
+
+    rc = find_dir_entry(name, &entry, NULL);
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = read_inode(entry.inode_no, &inode);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (offset >= (off_t) inode.size) {
+        return 0;
+    }
+
+    to_read_total = size;
+    if (offset + (off_t) to_read_total > (off_t) inode.size) {
+        to_read_total = (size_t) ((off_t) inode.size - offset);
+    }
+
+    if (inode.index_block == 0) {
+        return 0;
+    }
+
+    if (mfs_read_block(fd_disk, idx_data, inode.index_block) != 0) {
+        return -EIO;
+    }
+
+    while (bytes_read < to_read_total) {
+        uint32_t block_idx = (uint32_t) ((offset + (off_t) bytes_read) / MFS_BLOCK_SIZE);
+        uint32_t block_off = (uint32_t) ((offset + (off_t) bytes_read) % MFS_BLOCK_SIZE);
+        uint32_t to_read = MFS_BLOCK_SIZE - block_off;
+
+        if (to_read > to_read_total - bytes_read) {
+            to_read = (uint32_t) (to_read_total - bytes_read);
+        }
+
+        /* Defensive check against corrupted inode size */
+        if (block_idx >= MFS_BLOCK_SIZE / 4) {
+            return bytes_read > 0 ? (int) bytes_read : -EIO;
+        }
+
+        if (idx_data[block_idx] == 0) {
+            memset(buf + bytes_read, 0, to_read);
+        } else {
+            uint8_t blk_buf[MFS_BLOCK_SIZE];
+            if (mfs_read_block(fd_disk, blk_buf, idx_data[block_idx]) != 0) {
+                return bytes_read > 0 ? (int) bytes_read : -EIO;
+            }
+            memcpy(buf + bytes_read, blk_buf + block_off, to_read);
+        }
+
+        bytes_read += to_read;
+    }
+
+    return (int) bytes_read;
 }
 
 static int mfs_write(const char *path, const char *buf, size_t size, off_t offset,
                      struct fuse_file_info *fi)
 {
-    (void) path;
-    (void) buf;
-    (void) size;
-    (void) offset;
+    const char *name;
+    struct mfs_dir_entry entry;
+    struct mfs_inode inode;
+    uint32_t idx_data[MFS_BLOCK_SIZE / 4];
+    int rc = 0;
+    int allocated_index = 0;
+    size_t bytes_written = 0;
+
     (void) fi;
-    return -EOPNOTSUPP;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    name = path_name(path);
+    if (name == NULL || name[0] == '\0') {
+        return -EINVAL;
+    }
+
+    rc = find_dir_entry(name, &entry, NULL);
+    if (rc != 0) {
+        return rc;
+    }
+
+    rc = read_inode(entry.inode_no, &inode);
+    if (rc != 0) {
+        return rc;
+    }
+
+    /* Only appending is supported */
+    if (offset != (off_t) inode.size) {
+        return -EOPNOTSUPP;
+    }
+
+    /* Load or allocate the index block */
+    if (inode.index_block == 0) {
+        uint32_t ib;
+        rc = allocate_block(&ib);
+        if (rc != 0) {
+            return rc;
+        }
+        memset(idx_data, 0, sizeof(idx_data));
+        if (mfs_write_block(fd_disk, idx_data, ib) != 0) {
+            free_block(ib);
+            return -EIO;
+        }
+        inode.index_block = ib;
+        allocated_index = 1;
+    } else {
+        if (mfs_read_block(fd_disk, idx_data, inode.index_block) != 0) {
+            return -EIO;
+        }
+    }
+
+    while (bytes_written < size) {
+        uint32_t block_idx = (uint32_t) ((offset + (off_t) bytes_written) / MFS_BLOCK_SIZE);
+        uint32_t block_off = (uint32_t) ((offset + (off_t) bytes_written) % MFS_BLOCK_SIZE);
+        uint32_t to_write = MFS_BLOCK_SIZE - block_off;
+        int newly_allocated = 0;
+        uint32_t data_blk;
+
+        if (to_write > size - bytes_written) {
+            to_write = (uint32_t) (size - bytes_written);
+        }
+
+        /* Check file size limit: max 4096 blocks (64 MB) */
+        if (block_idx >= MFS_BLOCK_SIZE / 4) {
+            rc = -EFBIG;
+            break;
+        }
+
+        data_blk = idx_data[block_idx];
+        if (data_blk == 0) {
+            rc = allocate_block(&data_blk);
+            if (rc != 0) {
+                break;
+            }
+            newly_allocated = 1;
+        }
+
+        {
+            uint8_t blk_buf[MFS_BLOCK_SIZE];
+            if (newly_allocated) {
+                memset(blk_buf, 0, sizeof(blk_buf));
+            } else {
+                if (mfs_read_block(fd_disk, blk_buf, data_blk) != 0) {
+                    rc = -EIO;
+                    break;
+                }
+            }
+            memcpy(blk_buf + block_off, buf + bytes_written, to_write);
+            if (mfs_write_block(fd_disk, blk_buf, data_blk) != 0) {
+                if (newly_allocated) {
+                    free_block(data_blk);
+                }
+                rc = -EIO;
+                break;
+            }
+        }
+
+        if (newly_allocated) {
+            idx_data[block_idx] = data_blk;
+            inode.block_count++;
+        }
+
+        bytes_written += to_write;
+    }
+
+    if (bytes_written > 0 || allocated_index) {
+        inode.size += (uint32_t) bytes_written;
+        inode.mtime = (uint64_t) time(NULL);
+        if (mfs_write_block(fd_disk, idx_data, inode.index_block) != 0) {
+            return bytes_written > 0 ? (int) bytes_written : -EIO;
+        }
+        if (write_inode(&inode) != 0) {
+            return bytes_written > 0 ? (int) bytes_written : -EIO;
+        }
+    }
+
+    if (bytes_written > 0) {
+        return (int) bytes_written;
+    }
+    return rc != 0 ? rc : 0;
 }
 
 static int mfs_release(const char *path, struct fuse_file_info *fi)
