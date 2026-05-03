@@ -21,7 +21,7 @@ Current status:
 - unlink frees the file's data blocks and index block in addition to removing
   the directory entry and inode.
 
-Example:
+Running Commands:
 dd bs=16K count=1K if=/dev/zero of=disk1
 make
 ./make_mfs disk1
